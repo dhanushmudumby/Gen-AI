@@ -3,17 +3,17 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
+from mcp.client import Client
 import os
 import pandas as pd
-import psycopg2
 
-# Load environment variables
+# Load env vars
 load_dotenv()
 Deep_seek_R1_key = os.getenv("Deep_seek_R1_key")
 
-# Load schema from CSV automatically
-path = "C:/Users/dmudu/OneDrive/Desktop/AI-Impl/Gen-AI/db-schema.csv"
-db_schema = pd.read_csv(path).to_string(index=False)
+# Load DB schema from CSV
+schema_path = "C:/Users/dmudu/OneDrive/Desktop/AI-Impl/Gen-AI/db-schema.csv"
+db_schema = pd.read_csv(schema_path).to_string(index=False)
 
 # ---- Agent State ----
 class AgentState(TypedDict):
@@ -25,6 +25,7 @@ class AgentState(TypedDict):
     query_message: NotRequired[HumanMessage]
     response: NotRequired[AIMessage]
     db_name: NotRequired[str]
+    query_results: NotRequired[str]
 
 # ---- LLM model ----
 model = ChatOpenAI(
@@ -33,73 +34,69 @@ model = ChatOpenAI(
     model="deepseek/deepseek-r1:free",
 )
 
+# ---- Nodes ----
 def context_node(state: AgentState) -> AgentState:
     state["system_prompt"] = SystemMessage(
         content="You are an expert SQL generator. Given a DB schema and a natural language question, return only the SQL query without explanation."
     )
     schema_text = state["db_schema"].content if isinstance(state["db_schema"], HumanMessage) else state["db_schema"]
     state["db_schema"] = HumanMessage(content=schema_text)
-    state["instructions"] = 'use Table name in this format schema_name."table_name" to avoid ambiguity.'
-    state["schema_message"] = HumanMessage(
-        content=f"Database schema:\n{schema_text}"
-    )
+    state["instructions"] = 'Use table name format schema_name."table_name" to avoid ambiguity.'
+    state["schema_message"] = HumanMessage(content=f"Database schema:\n{schema_text}")
     return state
 
 def query_node(state: AgentState) -> AgentState:
     query_text = state["user_query"].content if isinstance(state["user_query"], HumanMessage) else state["user_query"]
-    state["query_message"] = HumanMessage(
-        content=f"User question:\n{query_text}"
-    )
+    state["query_message"] = HumanMessage(content=f"User question:\n{query_text}")
     messages = [
         state["system_prompt"],
-        state["instructions"],
+        HumanMessage(content=state["instructions"]),
         state["schema_message"],
         state["query_message"]
     ]
     llm_response = model.invoke(messages)
     state["response"] = llm_response
     return state
-def postgrs_node(state: AgentState) -> AgentState:
-    """Connect to PostgreSQL, execute query from previous node, return results."""
-    
+
+def mcp_postgres_node(state: AgentState) -> AgentState:
     sql_query = state["response"].content.strip()
 
+    # DB credentials from .env
     pg_host = os.getenv("PG_HOST")
-    pg_port = os.getenv("PG_PORT", "5432")
+    pg_port = int(os.getenv("PG_PORT", "5432"))
     pg_db   = os.getenv("PG_DB")
     pg_user = os.getenv("PG_USER")
     pg_pass = os.getenv("PG_PASS")
 
-    try:
-        conn = psycopg2.connect(
-            host=pg_host,
-            port=pg_port,
-            database=pg_db,
-            user=pg_user,
-            password=pg_pass
-        )
+    # Connect to MCP server
+    mcp_client = Client("ws://localhost:8765")  # Your MCP server address
+    result = mcp_client.call_tool(
+        "run_sql",
+        host=pg_host,
+        port=pg_port,
+        database=pg_db,
+        user=pg_user,
+        password=pg_pass,
+        query=sql_query
+    )
 
-        df = pd.read_sql_query(sql_query, conn)
-
-        state["query_results"] = df
-
-        conn.close()
-
-    except Exception as e:
-        state["query_results"] = pd.DataFrame({"error": [str(e)]})
-
+    state["query_results"] = result["content"]
     return state
 
+# ---- Graph ----
 graph = StateGraph(AgentState)
 graph.add_node("context", context_node)
 graph.add_node("query", query_node)
+graph.add_node("db_exec", mcp_postgres_node)
+
 graph.add_edge(START, "context")
 graph.add_edge("context", "query")
-graph.add_edge("query", END)
+graph.add_edge("query", "db_exec")
+graph.add_edge("db_exec", END)
 
 compiled_graph = graph.compile()
 
-# ---- Run in terminal ----
+# ---- CLI Loop ----
 if __name__ == "__main__":
     db_name = input("Enter the database name: ")
     while True:
@@ -116,3 +113,5 @@ if __name__ == "__main__":
 
         print("\nGenerated SQL Query:\n")
         print(result["response"].content)
+        print("\nQuery Execution Result:\n")
+        print(result["query_results"])
